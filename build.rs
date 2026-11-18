@@ -1,5 +1,12 @@
 fn main() {
     linker_be_nice();
+    slint_build::compile_with_config(
+        "ui/demo.slint",
+        slint_build::CompilerConfiguration::new().embed_resources(
+            slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer,
+        ),
+    )
+    .expect("compile Slint demo");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
 }

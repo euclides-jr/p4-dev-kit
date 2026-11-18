@@ -454,16 +454,14 @@ impl<'d> DsiDpi<'d> {
     pub fn commit(&mut self) {
         let back = (self.current_fb + 1) % self.num_fbs;
 
-        // Flush back buffer: CPU cache → PSRAM.
-        unsafe {
-            crate::soc::cache_writeback_addr(self.fb_ptrs[back] as u32, self.fb_size as u32);
-        }
-
-        // Update sar_lo in every LLI to point at the new front buffer.
-        // The DMA latches sar_lo at the start of each block, so an in-progress
-        // block is unaffected; the new pixels appear on the next block boundary.
         let src = self.fb_ptrs[back] as u32;
         LLI_STORAGE.with(|storage| {
+            // The block-done ISR also writes back cache lines. Keep its cache
+            // operation from interrupting this framebuffer writeback.
+            unsafe {
+                crate::soc::cache_writeback_addr(src, self.fb_size as u32);
+            }
+
             let storage = storage.get_mut();
             for lli in storage.iter() {
                 lli.set_source(src);

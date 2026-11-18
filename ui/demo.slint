@@ -1,0 +1,91 @@
+component DemoButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    min-width: 150px;
+    height: 100px;
+    border-radius: 20px;
+    background: touch.pressed ? #136c65 : #27566a;
+
+    Text {
+        text: root.label;
+        color: #f2f7ff;
+        font-size: 30px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+export component DemoScreen inherits Window {
+    property <int> count: 0;
+    width: 720px;
+    height: 1280px;
+    background: #0d1727;
+
+    VerticalLayout {
+        padding: 48px;
+        spacing: 24px;
+        alignment: center;
+
+        Text {
+            text: "ESP32-P4";
+            color: #59eed0;
+            font-size: 28px;
+            font-weight: 700;
+        }
+        Text {
+            text: "Slint demo";
+            color: #f2f7ff;
+            font-size: 76px;
+            font-weight: 700;
+        }
+        Rectangle {
+            height: 160px;
+            background: #1a2b43;
+            border-radius: 24px;
+            VerticalLayout {
+                padding: 28px;
+                alignment: center;
+                spacing: 8px;
+                Text {
+                    text: "MIPI DSI DISPLAY";
+                    color: #a7bcd3;
+                    font-size: 24px;
+                }
+                Text {
+                    text: "720 x 1280  /  RGB565";
+                    color: #f2f7ff;
+                    font-size: 38px;
+                }
+            }
+        }
+        Text {
+            text: "Count: " + root.count;
+            color: #f2f7ff;
+            font-size: 52px;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            spacing: 16px;
+            DemoButton {
+                label: "−";
+                clicked => { root.count -= 1; }
+            }
+            DemoButton {
+                label: "Reset";
+                clicked => { root.count = 0; }
+            }
+            DemoButton {
+                label: "+";
+                clicked => { root.count += 1; }
+            }
+        }
+        Rectangle {
+            height: 10px;
+            border-radius: 5px;
+            background: #59eed0;
+        }
+    }
+}

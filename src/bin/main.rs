@@ -23,8 +23,15 @@ use esp_hal::{
 #[path = "../waveshare_5dsi_touch_a.rs"]
 mod waveshare_5dsi_touch_a;
 
+#[path = "../gt911.rs"]
+mod gt911;
+
+#[path = "../slint_ui.rs"]
+mod slint_ui;
+
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    esp_println::println!("{info}");
     loop {}
 }
 
@@ -65,18 +72,33 @@ async fn main(spawner: Spawner) -> ! {
     .expect("configure display I2C")
     .with_sda(peripherals.GPIO7)
     .with_scl(peripherals.GPIO8);
-    i2c.write(0x45, &[0x95, 0x11])
-        .expect("enable backlight controller");
-    i2c.write(0x45, &[0x95, 0x17])
-        .expect("configure backlight controller");
-    i2c.write(0x45, &[0x96, 0x00])
-        .expect("set backlight start level");
-    Delay::new().delay_millis(100);
-    i2c.write(0x45, &[0x96, 0xFF])
-        .expect("turn on display backlight");
+    // The panel controller may need time to become ready after power-up.
+    let mut backlight_ready = false;
+    for _ in 0..20 {
+        if i2c.write(0x45, &[0x95, 0x11]).is_ok() {
+            backlight_ready = true;
+            break;
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+    if backlight_ready {
+        i2c.write(0x45, &[0x95, 0x17]).expect("configure backlight");
+        i2c.write(0x45, &[0x96, 0x00]).expect("set backlight start level");
+        Timer::after(Duration::from_millis(100)).await;
+        i2c.write(0x45, &[0x96, 0xff]).expect("turn on backlight");
+    } else {
+        esp_println::println!("Backlight controller unavailable at 0x45");
+    }
 
     Delay::new().delay_millis(1000);
-    let framebuffer = waveshare_5dsi_touch_a::allocate_test_framebuffer();
+    let framebuffer = waveshare_5dsi_touch_a::allocate_framebuffer();
+    let backbuffer = waveshare_5dsi_touch_a::allocate_framebuffer();
+    let mut ui = slint_ui::Ui::new().expect("initialize Slint demo");
+    ui.draw(&mut framebuffer.0);
+
+    esp_println::println!("Slint framebuffer drawn");
+    let touch = gt911::Gt911::detect(&mut i2c);
+    esp_println::println!("GT911 touchscreen detected: {}", touch.is_some());
 
     let mut bus = MipiDsi::new(
         peripherals.MIPI_DSI,
@@ -89,35 +111,21 @@ async fn main(spawner: Spawner) -> ! {
 
     waveshare_5dsi_touch_a::initialize_panel(&mut bus).expect("initialize HX8394 panel");
     let mut display = bus
-        .dpi(waveshare_5dsi_touch_a::DPI_CONFIG, &[&mut framebuffer.0])
+        .dpi(waveshare_5dsi_touch_a::DPI_CONFIG, &[&mut framebuffer.0, &mut backbuffer.0])
         .expect("start MIPI-DSI video stream");
     esp_println::println!("Waveshare 5-DSI-TOUCH-A display is streaming");
-    for offset in (0..0x94).step_by(4) {
-        // SAFETY: aligned reads within the ESP32-P4 DSI bridge register block.
-        let value = unsafe { core::ptr::read_volatile((esp_hal::peripherals::MIPI_DSI_BRIDGE::PTR as *const u8).add(offset).cast::<u32>()) };
-        esp_println::println!("BRG {:02x} {:08x}", offset, value);
-    }
-    // Measure scanout separately from application rendering throughput.
-    display.wait_for_vsync();
-    let started = esp_hal::time::Instant::now();
-    for _ in 0..120 {
-        display.wait_for_vsync();
-    }
-    let elapsed_us = started.elapsed().as_micros();
-    esp_println::println!("Scanout: 120 frames in {} us ({} milli-Hz)",
-        elapsed_us, 120_000_000_000u64 / elapsed_us);
-
     let _ = spawner;
-
     loop {
-        Timer::after(Duration::from_secs(5)).await;
-        let underrun = esp_hal::peripherals::MIPI_DSI_BRIDGE::regs()
-            .int_raw()
-            .read()
-            .underrun()
-            .bit_is_set();
-        esp_println::println!("DSI framebuffer underrun: {underrun}");
+        if let Some(touch) = &touch {
+            match touch.poll(&mut i2c) {
+                Ok(sample) => ui.touch(sample),
+                Err(_) => ui.touch(gt911::Sample::Released),
+            }
+        }
+        if ui.draw(display.framebuffer_mut()) {
+            display.commit();
+            display.wait_for_vsync();
+        }
+        Timer::after(Duration::from_millis(16)).await;
     }
-
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.2.2/examples
 }

@@ -8,7 +8,11 @@ version      = "0.1.0"
 name = "p4-dev-kit"
 path = "./src/bin/main.rs"
 
+[build-dependencies]
+slint-build = "=1.15.1"
+
 [dependencies]
+slint = { version = "=1.15.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
 esp-hal = { version = "~1.2.2", features = ["esp32p4", "unstable"] }
 
 esp-rtos = { version = "0.4.0", features = ["embassy", "esp32p4"] }

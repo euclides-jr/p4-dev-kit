@@ -69,35 +69,13 @@ pub fn initialize_panel(bus: &mut MipiDsi<'_>) -> Result<(), InitError> {
     Ok(())
 }
 
-/// Allocates and fills an RGB565 test pattern in the PSRAM-backed global heap.
-pub fn allocate_test_framebuffer() -> &'static mut Framebuffer {
+/// Allocates the aligned RGB565 scanout buffer in the PSRAM heap.
+pub fn allocate_framebuffer() -> &'static mut Framebuffer {
     let mut framebuffer = Box::<Framebuffer>::new_uninit();
-    let bytes = framebuffer.as_mut_ptr().cast::<u8>();
-
-    // SAFETY: `framebuffer` owns `FRAMEBUFFER_BYTES` bytes of allocated storage.
-    // Initializing each byte makes it valid to create a mutable `[u8]` slice.
+    // SAFETY: The allocation is aligned and all bytes are initialized here.
     unsafe {
-        ptr::write_bytes(bytes, 0, FRAMEBUFFER_BYTES);
-        let pixels = core::slice::from_raw_parts_mut(bytes.cast::<u16>(), WIDTH * HEIGHT);
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                pixels[y * WIDTH + x] = test_color(x);
-            }
-        }
-    }
-
-    // SAFETY: the entire byte array was initialized above.
-    Box::leak(unsafe { framebuffer.assume_init() })
-}
-
-const fn test_color(x: usize) -> u16 {
-    match x * 6 / WIDTH {
-        0 => 0xF800, // red
-        1 => 0x07E0, // green
-        2 => 0x001F, // blue
-        3 => 0xFFE0, // yellow
-        4 => 0xF81F, // magenta
-        _ => 0xFFFF, // white
+        ptr::write_bytes(framebuffer.as_mut_ptr().cast::<u8>(), 0, FRAMEBUFFER_BYTES);
+        Box::leak(framebuffer.assume_init())
     }
 }
 

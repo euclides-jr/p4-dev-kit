@@ -4,6 +4,10 @@ name         = "p4-dev-kit"
 rust-version = "1.95"
 version      = "0.1.0"
 
+[features]
+default = ["ppa-preview-sleep"]
+ppa-preview-sleep = []
+
 [[bin]]
 name = "p4-dev-kit"
 path = "./src/bin/main.rs"
@@ -13,9 +17,13 @@ slint-build = "=1.15.1"
 
 [dependencies]
 slint = { version = "=1.15.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
+i-slint-renderer-software = { version = "=1.15.1", default-features = false, features = ["experimental"] }
 esp-hal = { version = "~1.2.2", features = ["esp32p4", "unstable"] }
+esp32p4 = "0.3.0"
+es8311 = "0.1.1"
 
-esp-rtos = { version = "0.4.0", features = ["embassy", "esp32p4"] }
+esp-rtos = { version = "0.4.0", features = ["embassy", "esp32p4", "rtos-trace"] }
+rtos-trace = "0.2.0"
 
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32p4"] }
 esp-println            = { version = "0.18.0", features = ["esp32p4"] }
@@ -23,6 +31,11 @@ esp-alloc              = { version = "0.11.0", features = ["esp32p4", "global-al
 
 embassy-executor = { version = "0.10.0", features = [] }
 embassy-time     = "0.5.0"
+embassy-usb-host = "0.1.0"
+embassy-usb-driver = "0.2.2"
+embassy-sync = "0.8.0"
+embassy-futures = "0.1.2"
+zune-jpeg = { version = "0.5.15", default-features = false }
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
@@ -38,7 +51,7 @@ opt-level = "s"
 codegen-units = 1     # LLVM can perform better optimizations using a single thread
 debug         = 2     # prefer slower builds but better debugging experience
 lto           = 'fat'
-opt-level     = 's'
+opt-level     = 3
 
 
 [patch.crates-io]

@@ -1,3 +1,5 @@
+import { CameraPreview } from "camera-preview.slint";
+
 component DemoButton inherits Rectangle {
     in property <string> label;
     callback clicked();
@@ -19,11 +21,12 @@ component DemoButton inherits Rectangle {
 }
 
 export component DemoScreen inherits Window {
+    in property <bool> show-preview: true;
     in property <image> camera-frame;
     in property <bool> camera-ready;
     in property <bool> camera-overlay;
-    out property <int> camera-x: preview.absolute-position.x / 1px;
-    out property <int> camera-y: preview.absolute-position.y / 1px;
+    out property <int> camera-x: preview.preview-x;
+    out property <int> camera-y: preview.preview-y;
     out property <int> count: 0;
     width: 720px;
     height: 1280px;
@@ -66,31 +69,12 @@ export component DemoScreen inherits Window {
                 }
             }
         }
-        Rectangle {
-            height: 360px;
-            preview := Rectangle {
-                width: 640px;
-                height: 360px;
-                x: (parent.width - self.width) / 2;
-                background: root.camera-ready ? #080f19 : #0a1220;
-                Image {
-                    visible: root.camera-ready && !root.camera-overlay;
-                    width: parent.width;
-                    height: parent.height;
-                    source: root.camera-frame;
-                    image-fit: contain;
-                }
-                Text {
-                    visible: !root.camera-ready;
-                    text: "Waiting for USB camera";
-                    color: #a7bcd3;
-                    font-size: 26px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: parent.width;
-                    height: parent.height;
-                }
-            }
+        preview := CameraPreview {
+            visible: root.show-preview;
+            height: root.show-preview ? 360px : 0px;
+            camera-ready: root.camera-ready;
+            camera-overlay: root.camera-overlay;
+            camera-frame: root.camera-frame;
         }
         Text {
             text: "Count: " + root.count;

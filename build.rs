@@ -1,10 +1,15 @@
 fn main() {
     linker_be_nice();
+    let password_path = ".cargo/wifi-password";
+    println!("cargo:rerun-if-changed={password_path}");
+    println!("cargo:rustc-check-cfg=cfg(has_wifi_password)");
+    if std::path::Path::new(password_path).is_file() {
+        println!("cargo:rustc-cfg=has_wifi_password");
+    }
     slint_build::compile_with_config(
         "ui/demo.slint",
-        slint_build::CompilerConfiguration::new().embed_resources(
-            slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer,
-        ),
+        slint_build::CompilerConfiguration::new()
+            .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer),
     )
     .expect("compile Slint demo");
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)

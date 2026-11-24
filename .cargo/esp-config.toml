@@ -1,2 +1,3 @@
 # Keep user/runtime configuration values in this file.
 [env]
+P4_WIFI_SSID = "Vodafone-206C"

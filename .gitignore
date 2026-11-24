@@ -1,6 +1,7 @@
 # will have compiled files and executables
 debug/
 target/
+.cargo/wifi-password
 
 # Editor configuration
 .vscode/

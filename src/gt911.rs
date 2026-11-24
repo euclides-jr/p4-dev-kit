@@ -39,12 +39,26 @@ impl Gt911 {
         Ok(())
     }
 
+    async fn detect_async(i2c: &mut I2c<'_, Async>) -> Option<Self> {
+        for address in [0x5d, 0x14] {
+            let mut id = [0; 4];
+            if i2c
+                .write_read_async(address, &[0x81, 0x40], &mut id)
+                .await
+                .is_ok()
+                && id.starts_with(b"911")
+            {
+                return Some(Self(address));
+            }
+        }
+        None
+    }
+
     async fn poll(&self, i2c: &mut I2c<'_, Async>) -> Result<Sample, Error> {
         let mut status = [0];
         i2c.write_read_async(self.0, &[0x81, 0x4e], &mut status)
             .await?;
         if status[0] & 0x80 == 0 {
-            i2c.write_async(self.0, &[0x81, 0x4e, 0]).await?;
             return Ok(Sample::Unchanged);
         }
 
@@ -66,18 +80,52 @@ impl Gt911 {
 }
 
 #[embassy_executor::task]
-pub async fn run(touch: Gt911, i2c: I2c<'static, Blocking>) {
+pub async fn run(mut touch: Option<Gt911>, i2c: I2c<'static, Blocking>, mut backlight_setup: bool) {
     let mut i2c = i2c.into_async();
+    let mut backlight_ready = false;
     let mut last = Sample::Released;
     let mut previous_error = None;
+    let mut retry_at = embassy_time::Instant::now();
     loop {
-        match touch.poll(&mut i2c).await {
+        if embassy_time::Instant::now() >= retry_at {
+            if !backlight_ready {
+                let result = async {
+                    if !backlight_setup {
+                        i2c.write_async(0x45, &[0x95, 0x11]).await?;
+                        i2c.write_async(0x45, &[0x95, 0x17]).await?;
+                        i2c.write_async(0x45, &[0x96, 0x00]).await?;
+                        backlight_setup = true;
+                        Timer::after_millis(100).await;
+                    }
+                    i2c.write_async(0x45, &[0x96, 0xff]).await
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        backlight_ready = true;
+                        esp_println::println!("Backlight enabled");
+                    }
+                    Err(error) => {
+                        esp_println::println!("Backlight enable failed: {error:?}");
+                    }
+                }
+            }
+            if touch.is_none() {
+                touch = Gt911::detect_async(&mut i2c).await;
+                if touch.is_some() {
+                    esp_println::println!("GT911 touchscreen detected after retry");
+                }
+            }
+            retry_at = embassy_time::Instant::now() + embassy_time::Duration::from_secs(1);
+        }
+        let Some(device) = &touch else {
+            Timer::after_millis(100).await;
+            continue;
+        };
+        match device.poll(&mut i2c).await {
             Ok(sample) => {
                 previous_error = None;
                 if sample != Sample::Unchanged && sample != last {
-                    if last == Sample::Released || sample == Sample::Released {
-                        esp_println::println!("GT911 touch: {sample:?}");
-                    }
                     EVENTS.send(sample).await;
                     last = sample;
                 }

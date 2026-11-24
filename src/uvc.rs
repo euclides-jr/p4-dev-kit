@@ -20,7 +20,21 @@ pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 const MAX_PACKET_BYTES: usize = 1024;
 const TARGET_FRAME_INTERVAL: u32 = 10_000_000 / 15;
 
-pub static CAMERA_FRAME: Signal<CriticalSectionRawMutex, Option<Vec<u8>>> = Signal::new();
+pub(crate) static CAMERA_FRAME: Signal<CriticalSectionRawMutex, Option<Vec<u8>>> = Signal::new();
+
+/// A camera stream update. Frames contain complete MJPEG images.
+pub enum CameraEvent {
+    Frame(Vec<u8>),
+    Disconnected,
+}
+
+/// Returns the newest stream update, if one is available.
+pub fn take_frame() -> Option<CameraEvent> {
+    CAMERA_FRAME.try_take().map(|frame| match frame {
+        Some(frame) => CameraEvent::Frame(frame),
+        None => CameraEvent::Disconnected,
+    })
+}
 
 fn append_camera_payload(frame: &mut Vec<u8>, data: &[u8]) -> bool {
     let required = frame.len() + data.len();

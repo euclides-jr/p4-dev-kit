@@ -1,0 +1,32 @@
+export component CameraPreview inherits Rectangle {
+    in property <image> camera-frame;
+    in property <bool> camera-ready;
+    in property <bool> camera-overlay;
+    out property <int> preview-x: image-area.absolute-position.x / 1px;
+    out property <int> preview-y: image-area.absolute-position.y / 1px;
+    height: 360px;
+    image-area := Rectangle {
+        width: 640px;
+        height: 360px;
+        x: (parent.width - self.width) / 2;
+        background: root.camera-ready ? #080f19 : #0a1220;
+        Image {
+            visible: root.camera-ready && !root.camera-overlay;
+            width: parent.width;
+            height: parent.height;
+            source: root.camera-frame;
+            image-fit: contain;
+        }
+        Text {
+            visible: !root.camera-ready;
+            text: "Waiting for USB camera";
+            color: #a7bcd3;
+            font-size: 26px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: parent.width;
+            height: parent.height;
+        }
+    }
+}
+

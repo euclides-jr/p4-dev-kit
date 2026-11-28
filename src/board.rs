@@ -25,10 +25,12 @@ pub async fn run(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    esp_println::logger::init_logger(log::LevelFilter::Warn);
     esp_println::println!("P4 display firmware starting");
 
-    // Keep small, frequently accessed allocations such as JPEG working buffers in SRAM.
-    esp_alloc::heap_allocator!(size: 128 * 1024);
+    // Keep small working allocations in SRAM while leaving enough main-stack
+    // headroom for the ESP-Hosted protobuf encoder/decoder call chain.
+    esp_alloc::heap_allocator!(size: 64 * 1024);
 
     // The 720x1280 RGB565 framebuffer must live in PSRAM and be 64-byte aligned
     // for the MIPI-DSI VDMA engine.
@@ -109,7 +111,7 @@ pub async fn run(spawner: Spawner) -> ! {
         }
     }
     let amplifier = Output::new(peripherals.GPIO53, Level::Low, OutputConfig::default());
-    let _audio = match I2s::new(peripherals.I2S0, peripherals.DMA_CH1, audio::i2s_config()) {
+    let audio = match I2s::new(peripherals.I2S0, peripherals.DMA_CH1, audio::i2s_config()) {
         Ok(i2s) => {
             let i2s = i2s.with_mclk(peripherals.GPIO13).into_async();
             let tx = i2s
@@ -132,6 +134,27 @@ pub async fn run(spawner: Spawner) -> ! {
             None
         }
     };
+
+    if let Some(audio) = audio
+        && option_env!("SENDSPIN_SERVER_IP").is_some()
+        && option_env!("SENDSPIN_IDENTITY_KEY").is_some()
+    {
+        let layout =
+            core::alloc::Layout::from_size_align(crate::sendspin::pcm::PSRAM_BYTES, 4).unwrap();
+        let memory = unsafe {
+            esp_alloc::HEAP.alloc_caps(esp_alloc::MemoryCapability::External.into(), layout)
+        };
+        if memory.is_null() {
+            esp_println::println!("Sendspin: unable to allocate PSRAM buffers");
+        } else {
+            unsafe {
+                memory.write_bytes(0, layout.size());
+            }
+            let memory = unsafe { core::slice::from_raw_parts_mut(memory, layout.size()) };
+            crate::sendspin::pcm::init(memory);
+            spawner.spawn(crate::audio::playback(audio).unwrap());
+        }
+    }
 
     let mut bus = MipiDsi::new(
         peripherals.MIPI_DSI,
@@ -169,7 +192,7 @@ pub async fn run(spawner: Spawner) -> ! {
     );
     spawner
         .spawn(gt911::run(touch, i2c, backlight_setup).expect("spawn the display I2C task once"));
-    spawner.spawn(crate::wifi::run(slot, reset).expect("spawn Wi-Fi task once"));
+    spawner.spawn(crate::wifi::run(slot, reset, spawner).expect("spawn Wi-Fi task once"));
     loop {
         let updated = app.update();
         if app.draw(display.framebuffer_mut()).await {

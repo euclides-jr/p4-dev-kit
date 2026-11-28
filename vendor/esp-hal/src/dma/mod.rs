@@ -139,6 +139,10 @@ impl defmt::Format for DmaDescriptorFlags {
 /// A DMA transfer descriptor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+// Keep DMA ownership updates isolated from CPU updates to neighbouring
+// descriptors on cached SoCs. A shared cache line can otherwise overwrite
+// ownership bits that DMA changed while software was refilling the stream.
+#[cfg_attr(soc_internal_memory_cached, repr(align(64)))]
 #[cfg_attr(soc_has_axi_gdma, repr(C, align(8)))]
 #[cfg_attr(not(soc_has_axi_gdma), repr(C, align(4)))]
 pub struct DmaDescriptor {

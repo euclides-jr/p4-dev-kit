@@ -8,7 +8,8 @@ use crate::dma::aligned::DmaAlignedRef;
 // neighbouring data and a write would miss CPU-cached bytes. Control
 // transfers (SCR = 8 B, SSR / SWITCH = 64 B) we cannot align, so they are
 // bounced through an aligned scratch buffer. Two L2 cachelines cover every case.
-const BOUNCE_LEN: usize = 256;
+// Full aligned staging for Hosted batches, matching the IDF aligned-buffer path.
+const BOUNCE_LEN: usize = 32 * 1024;
 
 // Scratch layout for a bounced, cache-unaligned caller buffer: the unaligned
 // head occupies `[0, head_len)` and the unaligned tail
@@ -62,6 +63,11 @@ impl Bounce {
         let middle_len = split.middle(len);
 
         let scratch = self.buf.get_mut();
+        if len <= BOUNCE_LEN {
+            scratch.invalidate();
+            let ptr = dma_ptr_from_raw(scratch.as_ptr())?;
+            return Ok(Transfer::single(ptr, len));
+        }
         // Must invalidate before handing to DMA, otherwise evicting dirty cachelines can
         // corrupt the buffer contents.
         scratch.invalidate();
@@ -91,6 +97,11 @@ impl Bounce {
     pub fn read_finish(&mut self, buf: &mut [u8], split: Split) {
         let len = buf.len();
         let scratch = self.buf.get_ref();
+        scratch.invalidate();
+        if len <= BOUNCE_LEN {
+            buf.copy_from_slice(&scratch[..len]);
+            return;
+        }
         buf[..split.head].copy_from_slice(&scratch[..split.head]);
         buf[len - split.tail..]
             .copy_from_slice(&scratch[BOUNCE_TAIL_OFF..BOUNCE_TAIL_OFF + split.tail]);
@@ -102,6 +113,12 @@ impl Bounce {
         let middle_len = split.middle(len);
 
         let mut scratch = self.buf.get_mut();
+        if len <= BOUNCE_LEN {
+            scratch[..len].copy_from_slice(buf);
+            scratch.writeback();
+            let ptr = dma_ptr_from_raw(scratch.as_ptr())?;
+            return Ok(Transfer::single(ptr, len));
+        }
         scratch[..split.head].copy_from_slice(&buf[..split.head]);
         scratch[BOUNCE_TAIL_OFF..BOUNCE_TAIL_OFF + split.tail]
             .copy_from_slice(&buf[len - split.tail..]);

@@ -16,9 +16,16 @@ path = "./src/bin/main.rs"
 slint-build = "=1.15.1"
 
 [dependencies]
+log = "0.4"
+embedded-io-async = "0.7"
+base64 = { version = "0.22", default-features = false }
+sha1 = { version = "0.10", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-curve25519", "use-sha2"] }
 slint = { version = "=1.15.1", default-features = false, features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"] }
 i-slint-renderer-software = { version = "=1.15.1", default-features = false, features = ["experimental"] }
-esp-hal = { version = "~1.2.2", features = ["esp32p4", "unstable"] }
+esp-hal = { version = "~1.2.2", features = ["esp32p4", "unstable", "log-04"] }
 esp32p4 = "0.3.0"
 es8311 = "0.1.1"
 
@@ -26,7 +33,7 @@ esp-rtos = { version = "0.4.0", features = ["embassy", "esp32p4", "rtos-trace"] 
 rtos-trace = "0.2.0"
 
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32p4"] }
-esp-println            = { version = "0.18.0", features = ["esp32p4"] }
+esp-println            = { version = "0.18.0", features = ["esp32p4", "log-04"] }
 esp-alloc              = { version = "0.11.0", features = ["esp32p4", "global-allocator"] }
 
 embassy-executor = { version = "0.10.0", features = [] }
@@ -62,3 +69,5 @@ opt-level     = 3
 
 [patch.crates-io]
 esp-hal = { path = "vendor/esp-hal" }
+
+es8311 = { path = "vendor/es8311" }

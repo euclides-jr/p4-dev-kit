@@ -47,17 +47,14 @@ use sdio::{self as _, MmcError};
 #[cfg(sdmmc_has_gpio_matrix)]
 use crate::gpio::{OutputSignal, PinGuard, Pull};
 use crate::{
-    Async,
-    Blocking,
-    DriverMode,
+    Async, Blocking, DriverMode,
     asynch::AtomicWaker,
     dma::{
         DmaBufError,
         aligned::{DmaAlignedMut, DmaAlignedRef, InternalMemory},
     },
     gpio::{
-        InputSignal,
-        OutputConfig,
+        InputSignal, OutputConfig,
         interconnect::{self, PeripheralInput, PeripheralOutput},
     },
     peripherals::{Interrupt, SDHOST},
@@ -377,7 +374,8 @@ const CTRL_DMA_ENABLE: u32 = 1 << 5;
 const CTRL_USE_INTERNAL_DMA: u32 = 1 << 25;
 
 /// IDMAC descriptor count in the driver-owned ring.
-const RING_LEN: usize = 4;
+// Cover a 64 KiB Hosted RX batch plus cache-unaligned edges without refilling.
+const RING_LEN: usize = 18;
 /// Maximum bytes per descriptor (`SDMMC_DMA_MAX_BUF_LEN`).
 const DMA_MAX_BUF_LEN: usize = 4096;
 
@@ -387,8 +385,10 @@ const DESC_FIRST: u32 = 1 << 3;
 const DESC_CHAINED: u32 = 1 << 4;
 const DESC_OWN: u32 = 1 << 31;
 
-/// One 16-byte IDMAC linked-list descriptor.
-#[repr(C, align(4))]
+/// IDMAC descriptor; isolate ownership updates to one cache line on cached SoCs.
+#[repr(C)]
+#[cfg_attr(soc_internal_memory_cached, repr(align(64)))]
+#[cfg_attr(not(soc_internal_memory_cached), repr(align(4)))]
 #[derive(Clone, Copy)]
 struct Desc {
     flags: u32,
@@ -648,7 +648,21 @@ impl EngineSession {
         *ring.reborrow().into_inner() = [Desc::ZERO; RING_LEN];
         ring[0].flags |= DESC_FIRST;
         fill_descriptors(ring.reborrow(), &mut t, RING_LEN);
-        enable_idmac(ring.as_ptr() as u32);
+        #[cfg(soc_internal_memory_cached)]
+        {
+            let expected = (ring[0].flags, ring[0].sizes);
+            ring.writeback();
+            ring.invalidate();
+            let actual = (ring[0].flags, ring[0].sizes);
+            if expected != actual {
+                warn!(
+                    "SDMMC descriptor publication failed: expected={:?} actual={:?}",
+                    expected, actual
+                );
+                return Err(Error::DmaError.into());
+            }
+        }
+        enable_idmac(ring.as_ptr() as u32)?;
         r.pldmnd().write(|w| unsafe { w.bits(1) });
 
         let auto_stop = needs_auto_stop(index, block_count);
@@ -766,7 +780,21 @@ impl EngineSession {
         *ring.reborrow().into_inner() = [Desc::ZERO; RING_LEN];
         ring[0].flags |= DESC_FIRST;
         fill_descriptors(ring.reborrow(), &mut t, RING_LEN);
-        enable_idmac(ring.as_ptr() as u32);
+        #[cfg(soc_internal_memory_cached)]
+        {
+            let expected = (ring[0].flags, ring[0].sizes);
+            ring.writeback();
+            ring.invalidate();
+            let actual = (ring[0].flags, ring[0].sizes);
+            if expected != actual {
+                warn!(
+                    "SDMMC descriptor publication failed: expected={:?} actual={:?}",
+                    expected, actual
+                );
+                return Err(Error::DmaError.into());
+            }
+        }
+        enable_idmac(ring.as_ptr() as u32)?;
         r.pldmnd().write(|w| unsafe { w.bits(1) });
 
         arm_transfer(true, auto_stop, Some(t));
@@ -880,8 +908,8 @@ const EVT_IO_SLOT0: u32 = 1 << 16;
 const EVT_IO_SLOT1: u32 = 1 << 17;
 
 // `idsts` fatal DMA bits (fatal bus error / descriptor unavailable).
-const IDSTS_FBE: u32 = 1 << 2;
 const IDSTS_DU: u32 = 1 << 4;
+const IDSTS_FBE: u32 = 1 << 2;
 
 /// Interrupt mask kept armed while idle (card-detect only).
 const INTMASK_IDLE: u32 = EVT_CD;
@@ -1197,6 +1225,10 @@ fn on_interrupt() {
     let r = SDHOST::regs();
     let pending = r.mintsts().read().bits();
     let idsts = r.idsts().read().bits();
+    // Match ESP-IDF sdmmc_isr: acknowledge before recycling descriptors so
+    // completions raised during refill are preserved for the next interrupt.
+    r.rintsts().write(|w| unsafe { w.bits(pending) });
+    r.idsts().write(|w| unsafe { w.bits(idsts) });
 
     TRANSFER.with(|ts| {
         if ts.wait_busy {
@@ -1222,6 +1254,17 @@ fn on_interrupt() {
                 let err = map_rintsts(pending)
                     .err()
                     .or(if idsts & (IDSTS_FBE | IDSTS_DU) != 0 {
+                        warn!(
+                            "SDMMC DMA fault: idsts={:#x} cmd={:#x} bytes={}",
+                            idsts,
+                            r.cmd().read().bits(),
+                            r.bytcnt().read().bits()
+                        );
+                        warn!("SDMMC transferred card={} dma={} status={:#x}", r.tcbcnt().read().bits(), r.tbbcnt().read().bits(), pending);
+                        let descriptors = ring();
+                        #[cfg(soc_internal_memory_cached)]
+                        descriptors.invalidate();
+                        warn!("SDMMC descriptor base={:#x} current={:#x} buffer={:#x} d0={:#x}/{}/{:#x}/{:#x} d1={:#x}/{}/{:#x}/{:#x}", r.dbaddr().read().bits(), r.dscaddr().read().bits(), r.bufaddr().read().bits(), descriptors[0].flags, descriptors[0].sizes, descriptors[0].buf1, descriptors[0].next, descriptors[1].flags, descriptors[1].sizes, descriptors[1].buf1, descriptors[1].next);
                         Some(Error::DmaError)
                     } else {
                         None
@@ -1270,10 +1313,6 @@ fn on_interrupt() {
         SLOT_STATE[0].cd_waker.wake();
         SLOT_STATE[1].cd_waker.wake();
     }
-
-    // Write-1-clear the bits handled this pass.
-    r.rintsts().write(|w| unsafe { w.bits(pending) });
-    r.idsts().write(|w| unsafe { w.bits(idsts) });
 }
 
 /// SDMMC / SDIO host controller driver.
@@ -1305,6 +1344,9 @@ impl<'d> SdHostController<'d> {
         // the module clock drives the FIFO reset.
         chip_specific::set_module_clock(config.clock_source, config.module_div);
         this.reset_engine();
+        // ESP-IDF initializes IDMAC bus mode once at host startup.
+        SDHOST::regs().bmod().write(|w| w.swr().set_bit());
+        let _ = poll_until(|| !SDHOST::regs().bmod().read().swr().bit_is_set());
 
         SETTINGS.with(|s| s.module = config);
         let r = SDHOST::regs();
@@ -2258,6 +2300,9 @@ fn free_descriptors(ring: DmaAlignedMut<'_, [Desc; RING_LEN]>, next: usize) -> u
     let mut count = 0;
     for i in 0..RING_LEN {
         let d = &ring[(next + i) % RING_LEN];
+        // Match ESP-IDF get_free_descriptors_count: DMA clears OWN in memory.
+        #[cfg(soc_internal_memory_cached)]
+        unsafe { crate::dma::aligned::DmaAlignedRef::new_unchecked(d) }.invalidate();
         if d.flags & DESC_OWN != 0 {
             break;
         }
@@ -2300,17 +2345,20 @@ fn fill_descriptors(mut ring: DmaAlignedMut<'_, [Desc; RING_LEN]>, t: &mut Trans
         d.sizes = ((size + 3) & !3) as u32;
         d.buf1 = ptr;
         d.next = next_ptr;
+        // Publish only this released descriptor; writing back the whole ring
+        // could overwrite ownership updates made by DMA to active descriptors.
+        #[cfg(soc_internal_memory_cached)]
+        unsafe { DmaAlignedMut::new_unchecked(d) }.writeback();
         t.segs[t.seg].0 = ptr + size as u32;
         t.segs[t.seg].1 = rem - size;
         t.next_desc = (i + 1) % RING_LEN;
     }
-
-    #[cfg(soc_internal_memory_cached)]
-    ring.writeback();
 }
 
 fn reset_transfer() -> Result<(), Error> {
     let r = SDHOST::regs();
+    // Wait for the previous DMA stop before starting the next transaction.
+    poll_until(|| !r.ctrl().read().dma_reset().bit_is_set())?;
     r.ctrl().modify(|_, w| w.fifo_reset().set_bit());
     let res = poll_until(|| !r.ctrl().read().fifo_reset().bit_is_set());
 
@@ -2323,20 +2371,24 @@ fn reset_transfer() -> Result<(), Error> {
 
 /// Enables the IDMAC engine for a transfer and programs the descriptor base.
 ///
-/// `BMOD.SWR` resets the IDMAC's internal registers (including `DBADDR`) on
-/// this IP, so the descriptor base must be written *after* the reset,
-/// matching the ordering ESP-IDF uses in `sdmmc_host_dma_prepare`.
-fn enable_idmac(dbaddr: u32) {
+/// Match ESP-IDF sdmmc_host_dma_prepare: set the descriptor base and enable
+/// DMA without resetting bus mode on every transfer.
+fn enable_idmac(dbaddr: u32) -> Result<(), Error> {
     let r = SDHOST::regs();
+    // Reset internal descriptor-fetch state and wait before programming DBADDR.
+    // Otherwise an old descriptor can be consumed by the next transaction.
+    r.bmod().write(|w| w.swr().set_bit());
+    poll_until(|| !r.bmod().read().swr().bit_is_set())?;
+    r.idinten().write(|w| unsafe { w.bits(0) });
+    r.idsts().write(|w| unsafe { w.bits(0xffff_ffff) });
+    r.dbaddr().write(|w| unsafe { w.bits(dbaddr) });
     r.ctrl()
         .modify(|rd, w| unsafe { w.bits(rd.bits() | CTRL_DMA_ENABLE | CTRL_USE_INTERNAL_DMA) });
-    r.bmod().modify(|_, w| w.swr().set_bit());
-    r.idinten().write(|w| unsafe { w.bits(0) });
-    r.dbaddr().write(|w| unsafe { w.bits(dbaddr) });
     r.bmod().modify(|_, w| {
         w.de().set_bit();
         w.fb().set_bit()
     });
+    Ok(())
 }
 
 /// Disables the IDMAC engine after a transfer.

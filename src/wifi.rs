@@ -56,6 +56,8 @@ struct Hosted {
     tx_buffers: u32,
     uid: u32,
     associated: bool,
+    message: alloc::boxed::Box<Rpc>,
+    response: alloc::boxed::Box<Rpc>,
 }
 
 struct Frames<'a>(&'a [u8]);
@@ -96,6 +98,7 @@ impl Hosted {
         }
         let padded = (len as usize).next_multiple_of(4);
         if padded > buffer.len() {
+            esp_println::println!("SDIO RX batch {len} exceeds buffer {}", buffer.len());
             return Err(Error::Frame);
         }
         self.card
@@ -130,13 +133,31 @@ impl Hosted {
         Ok(())
     }
 
-    async fn init(&mut self, rx: &mut Aligned<A4, [u8]>) -> Result<(), Error> {
+    async fn init_card(&mut self) -> Result<(), Error> {
         self.card.reacquire(20_000_000).await?;
         self.card.enable_functions(1 << FUNCTION).await?;
         self.card.set_block_size(FUNCTION, BLOCK as u16).await?;
         self.card
             .cmd52_write(FUNCTION, HOST_INTERRUPT_REGISTER, 1)
             .await?;
+        Ok(())
+    }
+
+    async fn init(&mut self, rx: &mut Aligned<A4, [u8]>) -> Result<(), Error> {
+        // Match ESP-Hosted transport_card_init: 15 attempts, spaced by 100 ms,
+        // without resetting the coprocessor between failed card probes.
+        for attempt in 1..=15 {
+            let result = self.init_card().await;
+            Timer::after_millis(100).await;
+            match result {
+                Ok(()) => {
+                    esp_println::println!("SDIO card acquired (attempt {attempt})");
+                    break;
+                }
+                Err(error) if attempt == 15 => return Err(error),
+                Err(_) => {}
+            }
+        }
         loop {
             if self.receive(rx).await?.any(|(interface, payload)| {
                 interface == 5
@@ -150,8 +171,8 @@ impl Hosted {
         }
     }
 
-    fn handle_event(&mut self, rpc: &Rpc) {
-        match rpc.payload {
+    fn handle_event(&mut self) {
+        match self.message.payload {
             Some(Payload::EventStaConnected(_)) => self.associated = true,
             Some(Payload::EventStaDisconnected(_)) => self.associated = false,
             _ => {}
@@ -163,7 +184,7 @@ impl Hosted {
         rx: &mut Aligned<A4, [u8]>,
         id: RpcId,
         payload: Payload,
-    ) -> Result<Payload, Error> {
+    ) -> Result<(), Error> {
         self.uid = self.uid.wrapping_add(1);
         let uid = self.uid;
         let mut storage = Aligned::<A4, _>([0; BLOCK]);
@@ -181,20 +202,23 @@ impl Hosted {
         self.send(&storage, len).await?;
         let response = async {
             loop {
-                let mut response = None;
+                let mut matched = false;
                 for (interface, data) in self.receive(rx).await? {
-                    if let Some(rpc) = decode_rpc(interface, data) {
-                        self.handle_event(&rpc);
-                        if rpc.uid == uid
-                            && rpc.msg_type == RpcType::Resp
-                            && rpc.msg_id.0 == id.0 + 256
+                    if decode_rpc(interface, data, &mut self.message) {
+                        self.handle_event();
+                        if self.message.uid == uid
+                            && self.message.msg_type == RpcType::Resp
+                            && self.message.msg_id.0 == id.0 + 256
+                            && self.message.payload.is_some()
                         {
-                            response = rpc.payload;
+                            core::mem::swap(&mut self.message, &mut self.response);
+                            matched = true;
                         }
                     }
                 }
-                if let Some(payload) = response {
-                    return Ok(payload);
+                if matched {
+                    core::mem::swap(&mut self.message, &mut self.response);
+                    return Ok(());
                 }
                 Timer::after_millis(5).await;
             }
@@ -266,18 +290,17 @@ impl Hosted {
             Payload::ReqWifiStart(Default::default()),
         )
         .await?;
-        match self
-            .rpc(
-                rx,
-                RpcId::ReqGetMacAddress,
-                Payload::ReqGetMacAddress(proto::Rpc_Req_GetMacAddress { mode: 0 }),
-            )
-            .await?
-        {
-            Payload::RespGetMacAddress(reply) if reply.resp == 0 => {
+        self.rpc(
+            rx,
+            RpcId::ReqGetMacAddress,
+            Payload::ReqGetMacAddress(proto::Rpc_Req_GetMacAddress { mode: 0 }),
+        )
+        .await?;
+        match self.message.payload.as_ref() {
+            Some(Payload::RespGetMacAddress(reply)) if reply.resp == 0 => {
                 reply.mac.as_slice().try_into().map_err(|_| Error::Frame)
             }
-            Payload::RespGetMacAddress(reply) => {
+            Some(Payload::RespGetMacAddress(reply)) => {
                 Err(Error::Rpc(RpcId::ReqGetMacAddress, reply.resp))
             }
             _ => Err(Error::Frame),
@@ -290,12 +313,13 @@ impl Hosted {
         id: RpcId,
         payload: Payload,
     ) -> Result<(), Error> {
-        let status = match self.rpc(rx, id, payload).await? {
-            Payload::RespWifiInit(reply) => reply.resp,
-            Payload::RespSetWifiMode(reply) => reply.resp,
-            Payload::RespWifiSetConfig(reply) => reply.resp,
-            Payload::RespWifiStart(reply) => reply.resp,
-            Payload::RespWifiConnect(reply) => reply.resp,
+        self.rpc(rx, id, payload).await?;
+        let status = match self.message.payload.as_ref() {
+            Some(Payload::RespWifiInit(reply)) => reply.resp,
+            Some(Payload::RespSetWifiMode(reply)) => reply.resp,
+            Some(Payload::RespWifiSetConfig(reply)) => reply.resp,
+            Some(Payload::RespWifiStart(reply)) => reply.resp,
+            Some(Payload::RespWifiConnect(reply)) => reply.resp,
             _ => return Err(Error::Frame),
         };
         if status == 0 {
@@ -329,14 +353,40 @@ impl Hosted {
                 }
                 reconnect = embassy_time::Instant::now() + Duration::from_secs(10);
             }
-            for (interface, payload) in self.receive(rx).await? {
-                if let Some(rpc) = decode_rpc(interface, payload) {
-                    self.handle_event(&rpc);
+            let frames = {
+                use embassy_futures::select::{Either, select};
+                let mut receive = core::pin::pin!(self.receive(rx));
+                match select(receive.as_mut(), Timer::after_secs(2)).await {
+                    Either::First(result) => result?,
+                    Either::Second(()) => {
+                        let r = unsafe { &*esp32p4::SDHOST::ptr() };
+                        esp_println::println!(
+                            "SDIO stalled: cmd={:08x} irq={:08x} mask={:08x} dma={:08x} dma_mask={:08x} status={:08x} bytes={} card={} dma_count={}",
+                            r.cmd().read().bits(),
+                            r.rintsts().read().bits(),
+                            r.intmask().read().bits(),
+                            r.idsts().read().bits(),
+                            r.idinten().read().bits(),
+                            r.status().read().bits(),
+                            r.bytcnt().read().bits(),
+                            r.tcbcnt().read().bits(),
+                            r.tbbcnt().read().bits()
+                        );
+                        return Err(Error::Timeout);
+                    }
+                }
+            };
+            for (interface, payload) in frames {
+                if decode_rpc(interface, payload, &mut self.message) {
+                    self.handle_event();
                 } else if interface == 1 && self.associated && payload.len() <= MTU {
+                    // Never await RX space here: the network stack can be
+                    // waiting for us to drain TX acknowledgements first.
                     if let Some(packet) = runner.try_rx_buf() {
                         packet[..payload.len()].copy_from_slice(payload);
                         runner.rx_done(payload.len());
                     }
+                    embassy_futures::yield_now().await;
                 }
             }
             runner.set_link_state(if self.associated {
@@ -379,11 +429,15 @@ impl Hosted {
             self.rx_bytes = 0;
             self.tx_buffers = 0;
             self.associated = false;
-            reset.set_low();
-            Timer::after_millis(20).await;
+            // ESP-Hosted reset_slave: establish HIGH, pulse LOW, then settle.
             reset.set_high();
-            Timer::after_millis(500).await;
-            let result = match with_timeout(Duration::from_secs(3), self.init(rx)).await {
+            Timer::after_millis(10).await;
+            reset.set_low();
+            Timer::after_millis(10).await;
+            reset.set_high();
+            // ESP_HOSTED_HOST_CP_RESET_SETTLE_MS defaults to 1500 for SDIO.
+            Timer::after_millis(1500).await;
+            let result = match with_timeout(Duration::from_secs(5), self.init(rx)).await {
                 Ok(Ok(())) => {
                     esp_println::println!("ESP-Hosted initialization event received from C6");
                     self.configure(rx, password).await
@@ -403,9 +457,9 @@ impl Hosted {
     }
 }
 
-fn decode_rpc(interface: u8, payload: &[u8]) -> Option<Rpc> {
+fn decode_rpc(interface: u8, payload: &[u8], rpc: &mut Rpc) -> bool {
     if interface != 3 || payload.len() < SERIAL_TLV {
-        return None;
+        return false;
     }
     let tlv = &payload[..SERIAL_TLV];
     if tlv[0] != 1
@@ -414,12 +468,11 @@ fn decode_rpc(interface: u8, payload: &[u8]) -> Option<Rpc> {
         || (&tlv[3..9] != b"RPCRsp" && &tlv[3..9] != b"RPCEvt")
         || usize::from(u16::from_le_bytes([tlv[10], tlv[11]])) != payload.len() - SERIAL_TLV
     {
-        return None;
+        return false;
     }
     let data = &payload[SERIAL_TLV..];
-    let mut rpc = Rpc::default();
-    rpc.decode(&mut PbDecoder::new(data), data.len()).ok()?;
-    Some(rpc)
+    *rpc = Rpc::default();
+    rpc.decode(&mut PbDecoder::new(data), data.len()).is_ok()
 }
 
 fn report(error: Error) {
@@ -443,7 +496,11 @@ async fn print_lease(stack: Stack<'_>) {
 }
 
 #[embassy_executor::task]
-pub async fn run(slot: Slot<'static, 1, Async>, mut reset: Output<'static>) {
+pub async fn run(
+    slot: Slot<'static, 1, Async>,
+    mut reset: Output<'static>,
+    spawner: embassy_executor::Spawner,
+) {
     let password = PASSWORD.strip_suffix(b"\n").unwrap_or(PASSWORD);
     let password = password.strip_suffix(b"\r").unwrap_or(password);
     if SSID.is_empty() || SSID.len() > 32 {
@@ -458,8 +515,8 @@ pub async fn run(slot: Slot<'static, 1, Async>, mut reset: Output<'static>) {
     }
 
     // The coprocessor can queue multiple frames before the host polls it.
-    static RX: ConstStaticCell<Aligned<A4, [u8; 16 * FRAME]>> =
-        ConstStaticCell::new(Aligned([0; 16 * FRAME]));
+    static RX: ConstStaticCell<Aligned<A4, [u8; 64 * 1024]>> =
+        ConstStaticCell::new(Aligned([0; 64 * 1024]));
     let rx: &mut Aligned<A4, [u8]> = RX.take();
     let mut hosted = Hosted {
         card: SdioCard::new_uninit(slot, Delay),
@@ -467,10 +524,12 @@ pub async fn run(slot: Slot<'static, 1, Async>, mut reset: Output<'static>) {
         tx_buffers: 0,
         uid: 0,
         associated: false,
+        message: alloc::boxed::Box::new(Rpc::default()),
+        response: alloc::boxed::Box::new(Rpc::default()),
     };
     let mac = hosted.restart(rx, &mut reset, password).await;
 
-    static CHANNEL: StaticCell<channel::State<MTU, 4, 4>> = StaticCell::new();
+    static CHANNEL: StaticCell<channel::State<MTU, 32, 8>> = StaticCell::new();
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
     let (mut transport, device) = channel::new(
         CHANNEL.init_with(channel::State::new),
@@ -484,6 +543,7 @@ pub async fn run(slot: Slot<'static, 1, Async>, mut reset: Output<'static>) {
         RESOURCES.init_with(StackResources::new),
         seed,
     );
+    crate::sendspin::start(spawner, stack);
     join(join(network.run(), print_lease(stack)), async {
         loop {
             if let Err(error) = hosted.run_network(rx, &mut transport).await {

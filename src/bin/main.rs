@@ -40,6 +40,9 @@ mod app;
 #[path = "../board.rs"]
 mod board;
 
+#[path = "../sendspin.rs"]
+mod sendspin;
+
 #[path = "../wifi.rs"]
 mod wifi;
 

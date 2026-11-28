@@ -55,15 +55,21 @@ fn cache_l2_bus(addr: u32) -> u32 {
 /// Writes back a specific range of data in the cache.
 pub(crate) unsafe fn cache_writeback_addr(addr: u32, size: u32) {
     unsafe extern "C" {
-        fn Cache_WriteBack_Addr(bus: u32, addr: u32, size: u32);
+        fn Cache_WriteBack_Addr(bus: u32, addr: u32, size: u32) -> i32;
     }
 
     unsafe {
+        // Complete and publish CPU stores before asking ROM to clean dirty
+        // cache lines. The ROM call takes integer addresses, not Rust pointers.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
         // Write L1 back before L2, matching ESP-IDF cache_ll_writeback_addr.
-        Cache_WriteBack_Addr(CACHE_MAP_L1_DCACHE, addr, size);
+        assert_eq!(Cache_WriteBack_Addr(CACHE_MAP_L1_DCACHE, addr, size), 0);
         if cache_l2_bus(addr) != 0 {
-            Cache_WriteBack_Addr(CACHE_MAP_L2_CACHE, addr, size);
+            assert_eq!(Cache_WriteBack_Addr(CACHE_MAP_L2_CACHE, addr, size), 0);
         }
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -74,7 +80,11 @@ pub(crate) unsafe fn cache_invalidate_addr(addr: u32, size: u32) {
     }
 
     unsafe {
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
         Cache_Invalidate_Addr(CACHE_MAP_L1_DCACHE | cache_l2_bus(addr), addr, size);
+        core::arch::asm!("fence iorw, iorw", options(nostack));
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     }
 }
 
